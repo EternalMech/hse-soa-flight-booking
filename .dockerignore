@@ -1,0 +1,10 @@
+.git
+.venv
+.venv-codegen
+__pycache__
+*.pyc
+.env
+.env.*
+build
+docs
+.DS_Store

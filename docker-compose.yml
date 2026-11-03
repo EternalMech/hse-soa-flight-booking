@@ -1,0 +1,223 @@
+name: hse-soa-flight-booking
+
+services:
+  booking-db:
+    image: postgres:17.10-bookworm
+    environment:
+      POSTGRES_DB: booking
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: ${BOOKING_DB_PASSWORD:-booking_dev}
+    volumes:
+      - booking_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booking -d booking"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  flight-db:
+    image: postgres:17.10-bookworm
+    environment:
+      POSTGRES_DB: flight
+      POSTGRES_USER: flight
+      POSTGRES_PASSWORD: ${FLIGHT_DB_PASSWORD:-flight_dev}
+    volumes:
+      - flight_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flight -d flight"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  booking-migrate:
+    image: flyway/flyway:13.10.3
+    command: ["-connectRetries=10", "migrate"]
+    environment:
+      FLYWAY_URL: jdbc:postgresql://booking-db:5432/booking
+      FLYWAY_USER: booking
+      FLYWAY_PASSWORD: ${BOOKING_DB_PASSWORD:-booking_dev}
+      FLYWAY_LOCATIONS: filesystem:/flyway/migrations
+    volumes:
+      - ./migrations/booking:/flyway/migrations:ro
+    depends_on:
+      booking-db:
+        condition: service_healthy
+
+  flight-migrate:
+    image: flyway/flyway:13.10.3
+    command: ["-connectRetries=10", "migrate"]
+    environment:
+      FLYWAY_URL: jdbc:postgresql://flight-db:5432/flight
+      FLYWAY_USER: flight
+      FLYWAY_PASSWORD: ${FLIGHT_DB_PASSWORD:-flight_dev}
+      FLYWAY_LOCATIONS: filesystem:/flyway/migrations
+    volumes:
+      - ./migrations/flight:/flyway/migrations:ro
+    depends_on:
+      flight-db:
+        condition: service_healthy
+
+  flight:
+    build:
+      context: .
+      target: flight
+    image: hse-soa-flight-service:dev
+    environment:
+      PGHOST: flight-db
+      PGDATABASE: flight
+      PGUSER: flight
+      PGPASSWORD: ${FLIGHT_DB_PASSWORD:-flight_dev}
+      FLIGHT_API_KEY: ${FLIGHT_API_KEY:-flight-booking-local-development-key}
+      REDIS_SENTINELS: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      REDIS_MASTER_NAME: flight-cache
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+    ports:
+      - "127.0.0.1:${FLIGHT_PORT:-50051}:50051"
+    healthcheck:
+      test: ["CMD", "python", "-m", "services.flight.healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    depends_on:
+      flight-migrate:
+        condition: service_completed_successfully
+      sentinel-1:
+        condition: service_healthy
+      sentinel-2:
+        condition: service_healthy
+      sentinel-3:
+        condition: service_healthy
+    init: true
+
+  booking:
+    build:
+      context: .
+      target: booking
+    image: hse-soa-booking-service:dev
+    environment:
+      PGHOST: booking-db
+      PGDATABASE: booking
+      PGUSER: booking
+      PGPASSWORD: ${BOOKING_DB_PASSWORD:-booking_dev}
+      FLIGHT_API_KEY: ${FLIGHT_API_KEY:-flight-booking-local-development-key}
+      CIRCUIT_FAILURE_THRESHOLD: ${CIRCUIT_FAILURE_THRESHOLD:-5}
+      CIRCUIT_RESET_SECONDS: ${CIRCUIT_RESET_SECONDS:-10}
+      CIRCUIT_FAILURE_WINDOW_SECONDS: ${CIRCUIT_FAILURE_WINDOW_SECONDS:-60}
+      RECOVERY_INTERVAL_SECONDS: ${RECOVERY_INTERVAL_SECONDS:-2}
+      RECOVERY_GRACE_SECONDS: ${RECOVERY_GRACE_SECONDS:-5}
+      FLIGHT_GRPC_TARGET: flight:50051
+      FLIGHT_RPC_TIMEOUT_SECONDS: ${FLIGHT_RPC_TIMEOUT_SECONDS:-3}
+    ports:
+      - "127.0.0.1:${BOOKING_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    depends_on:
+      booking-migrate:
+        condition: service_completed_successfully
+      flight:
+        condition: service_healthy
+    init: true
+
+  redis-master:
+    image: redis:7.4-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
+    command: ["sh", "/config/start-node.sh"]
+    environment:
+      REDIS_HOST: redis-master
+      REDIS_INITIAL_REPLICA: "0"
+    volumes:
+      - ./redis/start-node.sh:/config/start-node.sh:ro
+      - redis_master_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis-replica:
+    image: redis:7.4-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
+    command: ["sh", "/config/start-node.sh"]
+    environment:
+      REDIS_HOST: redis-replica
+      REDIS_INITIAL_REPLICA: "1"
+    volumes:
+      - ./redis/start-node.sh:/config/start-node.sh:ro
+      - redis_replica_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      redis-master:
+        condition: service_healthy
+
+  sentinel-1:
+    image: redis:7.4-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
+    command: ["sh", "/config/start-sentinel.sh"]
+    environment:
+      SENTINEL_HOST: sentinel-1
+    volumes:
+      - ./redis/start-sentinel.sh:/config/start-sentinel.sh:ro
+      - sentinel_1_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+
+  sentinel-2:
+    image: redis:7.4-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
+    command: ["sh", "/config/start-sentinel.sh"]
+    environment:
+      SENTINEL_HOST: sentinel-2
+    volumes:
+      - ./redis/start-sentinel.sh:/config/start-sentinel.sh:ro
+      - sentinel_2_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+
+  sentinel-3:
+    image: redis:7.4-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
+    command: ["sh", "/config/start-sentinel.sh"]
+    environment:
+      SENTINEL_HOST: sentinel-3
+    volumes:
+      - ./redis/start-sentinel.sh:/config/start-sentinel.sh:ro
+      - sentinel_3_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+
+volumes:
+  booking_data:
+  flight_data:
+  redis_master_data:
+  redis_replica_data:
+  sentinel_1_data:
+  sentinel_2_data:
+  sentinel_3_data:

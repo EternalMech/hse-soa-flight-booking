@@ -1,0 +1,418 @@
+openapi: 3.0.3
+info:
+  title: Flight Booking API
+  version: 1.0.0
+  description: >-
+    Клиентский API Booking Service. Цены и суммы передаются целыми числами
+    рублей без дробной части, время — в UTC. user_id задаёт клиент; пользовательская
+    авторизация не входит в этот контракт. Межсервисный API Key клиенту не передаётся.
+servers:
+  - url: /
+tags:
+  - name: Flights
+  - name: Bookings
+paths:
+  /flights:
+    get:
+      operationId: searchFlights
+      tags: [Flights]
+      summary: Найти рейсы
+      description: >-
+        Только SCHEDULED. Дата относится к вылету по UTC. Без даты возвращаются
+        все подходящие рейсы. Пустая выдача — 200 с items: [].
+        Сортировка по departure_time, затем id. Аэропорты должны различаться.
+      parameters:
+        - name: origin
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/AirportCode'
+        - name: destination
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/AirportCode'
+        - name: date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+            pattern: '^\d{4}-\d{2}-\d{2}$'
+          example: '2026-12-01'
+      responses:
+        '200':
+          description: Результаты поиска
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Flight'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /flights/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: getFlight
+      tags: [Flights]
+      summary: Получить рейс
+      description: Возвращает существующий рейс в любом статусе.
+      responses:
+        '200':
+          description: Рейс
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Flight'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /bookings:
+    post:
+      operationId: createBooking
+      tags: [Bookings]
+      summary: Создать бронирование
+      description: >-
+        GetFlight → ReserveSeats → сохранение CONFIRMED. id назначает сервер.
+        total_price фиксируется по цене GetFlight. При неуспешном резервировании
+        бронирование не создаётся. Повтор POST является новым запросом создания;
+        идемпотентность gRPC по booking_id не означает идемпотентность REST POST.
+        После сбоя возможный резерв освобождается фоновым восстановлением.
+        При потере HTTP-ответа уже созданное бронирование может существовать.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookingCreate'
+      responses:
+        '201':
+          description: Бронирование подтверждено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      operationId: listBookings
+      tags: [Bookings]
+      summary: Получить бронирования пользователя
+      description: >-
+        Возвращает CONFIRMED и CANCELLED. Сортировка по created_at, затем id.
+        Если записей нет — 200 с пустым items.
+      parameters:
+        - name: user_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Бронирования пользователя
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /bookings/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      operationId: getBooking
+      tags: [Bookings]
+      summary: Получить бронирование
+      responses:
+        '200':
+          description: Бронирование
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /bookings/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      operationId: cancelBooking
+      tags: [Bookings]
+      summary: Отменить бронирование
+      description: >-
+        Допустимо только для CONFIRMED. После успешного ReleaseReservation
+        записывается CANCELLED. Повторная отмена уже CANCELLED возвращает 409;
+        места повторно не возвращаются. Тело запроса не требуется.
+        После ошибки сохранённое намерение отмены может быть завершено фоном;
+        актуальный статус следует перечитать через GET.
+      responses:
+        '200':
+          description: Отменённое бронирование
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    ValidationError:
+      description: VALIDATION_ERROR — неверные поля или параметры; details содержит нарушения.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: FLIGHT_NOT_FOUND или BOOKING_NOT_FOUND.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: >-
+        INSUFFICIENT_SEATS, RESERVATION_NOT_ALLOWED, RESERVATION_CONFLICT
+        или BOOKING_NOT_CANCELABLE.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UpstreamError:
+      description: FLIGHT_AUTH_FAILED или FLIGHT_BAD_RESPONSE — ошибка взаимодействия сервисов.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: FLIGHT_UNAVAILABLE, CIRCUIT_OPEN, OPERATION_ABORTED или DATABASE_UNAVAILABLE.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Timeout:
+      description: FLIGHT_TIMEOUT — истёк срок ожидания Flight Service.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: INTERNAL_ERROR — непредвиденная ошибка; внутренние сведения не раскрываются.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    AirportCode:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      minLength: 3
+      maxLength: 3
+      example: SVO
+    Money:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 9999999999000
+      description: Положительная сумма в целых рублях. Дробная часть не поддерживается.
+      example: 12500
+    Airline:
+      type: object
+      additionalProperties: false
+      required: [code, name]
+      properties:
+        code:
+          type: string
+          pattern: '^[A-Z0-9]{2}$'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+    Flight:
+      type: object
+      additionalProperties: false
+      required: [id, flight_number, airline, origin, destination, departure_time, arrival_time, total_seats, available_seats, price, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        flight_number:
+          type: string
+          pattern: '^[A-Z0-9]{2}[0-9]{1,4}$'
+        airline:
+          $ref: '#/components/schemas/Airline'
+        origin:
+          $ref: '#/components/schemas/AirportCode'
+        destination:
+          $ref: '#/components/schemas/AirportCode'
+        departure_time:
+          type: string
+          format: date-time
+        arrival_time:
+          type: string
+          format: date-time
+        total_seats:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        available_seats:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: Не больше total_seats.
+        price:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+            - maximum: 9999999999
+          description: Цена одного места, от 1 до 9999999999 целых рублей.
+        status:
+          type: string
+          enum: [SCHEDULED, DEPARTED, CANCELLED, COMPLETED]
+    BookingCreate:
+      type: object
+      additionalProperties: false
+      required: [user_id, flight_id, passenger_name, passenger_email, seat_count]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        flight_id:
+          type: string
+          format: uuid
+        passenger_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: '\S'
+        passenger_email:
+          type: string
+          format: email
+          maxLength: 254
+          pattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+        seat_count:
+          type: integer
+          minimum: 1
+          maximum: 1000
+    Booking:
+      type: object
+      additionalProperties: false
+      required: [id, user_id, flight_id, passenger_name, passenger_email, seat_count, total_price, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        flight_id:
+          type: string
+          format: uuid
+        passenger_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: '\S'
+        passenger_email:
+          type: string
+          format: email
+          maxLength: 254
+          pattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+        seat_count:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        total_price:
+          $ref: '#/components/schemas/Money'
+        status:
+          type: string
+          enum: [CONFIRMED, CANCELLED]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error_code, message]
+      properties:
+        error_code:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
